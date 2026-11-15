@@ -62,10 +62,22 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def send_via_resend(api_key: str, recipient: str, sender_name: str, sender_email: str, content: str) -> bool:
+    from_addr = os.getenv("RESEND_FROM", "Portfolio Contact <onboarding@resend.dev>").strip()
+    # Resend restricts free tier: 'from' cannot be @gmail.com without domain DNS verification.
+    # It must be onboarding@resend.dev.
+    if any(provider in from_addr.lower() for provider in ["@gmail.com", "@yahoo.com", "@outlook.com", "@hotmail.com"]):
+        logging.getLogger(__name__).warning(
+            "RESEND_FROM contains a public email provider (%s). Overriding to 'Portfolio Contact <onboarding@resend.dev>'.",
+            from_addr,
+        )
+        from_addr = "Portfolio Contact <onboarding@resend.dev>"
+    elif "<" not in from_addr and "@" in from_addr:
+        from_addr = f"Portfolio Contact <{from_addr}>"
+
     payload = {
-        "from": os.getenv("RESEND_FROM", "Portfolio Contact <onboarding@resend.dev>"),
-        "to": [recipient],
-        "reply_to": sender_email,
+        "from": from_addr,
+        "to": [recipient.strip()],
+        "reply_to": sender_email.strip(),
         "subject": f"New Portfolio Message from {sender_name}",
         "text": (
             f"You have received a new contact submission from your portfolio website:\n\n"
@@ -79,16 +91,62 @@ def send_via_resend(api_key: str, recipient: str, sender_name: str, sender_email
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/json",
             "User-Agent": "PortfolioBackend/1.0",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        if resp.status in (200, 201):
-            logging.getLogger(__name__).info("Contact notification delivered via Resend API to %s", recipient)
-            return True
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 201):
+                logging.getLogger(__name__).info("Contact notification delivered via Resend API to %s", recipient)
+                return True
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")
+        logging.getLogger(__name__).error(
+            "Resend API HTTP Error %s: %s (Check that recipient matches your Resend account email)",
+            err.code,
+            body,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).error("Resend API failed: %s", exc)
+    return False
+
+
+def send_via_web3forms(access_key: str, sender_name: str, sender_email: str, content: str) -> bool:
+    payload = {
+        "access_key": access_key.strip(),
+        "name": sender_name,
+        "email": sender_email,
+        "subject": f"New Portfolio Message from {sender_name}",
+        "message": (
+            f"You have received a new message from your portfolio contact form:\n\n"
+            f"Name: {sender_name}\n"
+            f"Email: {sender_email}\n"
+            f"Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Message:\n{content}\n"
+        ),
+    }
+    req = urllib.request.Request(
+        "https://api.web3forms.com/submit",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "PortfolioBackend/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 201):
+                logging.getLogger(__name__).info("Contact notification delivered via Web3Forms")
+                return True
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")
+        logging.getLogger(__name__).error("Web3Forms API HTTP Error %s: %s", err.code, body)
+    except Exception as exc:
+        logging.getLogger(__name__).error("Web3Forms API failed: %s", exc)
     return False
 
 
@@ -157,34 +215,39 @@ def send_via_discord(webhook_url: str, sender_name: str, sender_email: str, cont
 
 def send_contact_email(sender_name: str, sender_email: str, message_content: str) -> None:
     resend_api_key = os.getenv("RESEND_API_KEY")
+    web3forms_key = os.getenv("WEB3FORMS_ACCESS_KEY")
     brevo_api_key = os.getenv("BREVO_API_KEY")
     discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
-    target_email = os.getenv("EMAIL_HOST_USER") or os.getenv("DEFAULT_FROM_EMAIL") or "abishek.s2606@gmail.com"
+
+    # Priority target email: RESEND_TO allows overriding if Resend account is registered with another email
+    target_email = (
+        os.getenv("RESEND_TO")
+        or os.getenv("EMAIL_HOST_USER")
+        or os.getenv("DEFAULT_FROM_EMAIL")
+        or "abishek.s2606@gmail.com"
+    )
 
     # 1. Try Resend HTTP API (Port 443 / HTTPS - not blocked by Render Free Tier)
     if resend_api_key:
-        try:
-            if send_via_resend(resend_api_key, target_email, sender_name, sender_email, message_content):
-                return
-        except Exception as exc:
-            logging.getLogger(__name__).error("Resend API failed: %s", exc)
+        if send_via_resend(resend_api_key, target_email, sender_name, sender_email, message_content):
+            return
 
-    # 2. Try Brevo HTTP API (Port 443 / HTTPS)
+    # 2. Try Web3Forms (Port 443 / HTTPS - zero domain setup, sends straight to your email)
+    if web3forms_key:
+        if send_via_web3forms(web3forms_key, sender_name, sender_email, message_content):
+            return
+
+    # 3. Try Brevo HTTP API (Port 443 / HTTPS)
     if brevo_api_key:
-        try:
-            if send_via_brevo(brevo_api_key, target_email, sender_name, sender_email, message_content):
-                return
-        except Exception as exc:
-            logging.getLogger(__name__).error("Brevo API failed: %s", exc)
+        if send_via_brevo(brevo_api_key, target_email, sender_name, sender_email, message_content):
+            return
 
-    # 3. Optional Discord Webhook for instant notification
+    # 4. Optional Discord Webhook for instant notification
     if discord_webhook:
-        try:
-            send_via_discord(discord_webhook, sender_name, sender_email, message_content)
-        except Exception as exc:
-            logging.getLogger(__name__).error("Discord webhook failed: %s", exc)
+        if send_via_discord(discord_webhook, sender_name, sender_email, message_content):
+            return
 
-    # 4. Fallback to standard SMTP (Gmail)
+    # 5. Fallback to standard SMTP (Gmail) for local development
     email_host = os.getenv("EMAIL_HOST")
     email_port = int(os.getenv("EMAIL_PORT", "587"))
     email_user = os.getenv("EMAIL_HOST_USER")
