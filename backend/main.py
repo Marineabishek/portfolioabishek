@@ -1,6 +1,9 @@
-import os
+import json
 import logging
+import os
 import smtplib
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -58,7 +61,130 @@ engine, ACTIVE_DATABASE_URL = init_db_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
+def send_via_resend(api_key: str, recipient: str, sender_name: str, sender_email: str, content: str) -> bool:
+    payload = {
+        "from": os.getenv("RESEND_FROM", "Portfolio Contact <onboarding@resend.dev>"),
+        "to": [recipient],
+        "reply_to": sender_email,
+        "subject": f"New Portfolio Message from {sender_name}",
+        "text": (
+            f"You have received a new contact submission from your portfolio website:\n\n"
+            f"Name: {sender_name}\n"
+            f"Email: {sender_email}\n"
+            f"Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Message:\n{content}\n"
+        ),
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "PortfolioBackend/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status in (200, 201):
+            logging.getLogger(__name__).info("Contact notification delivered via Resend API to %s", recipient)
+            return True
+    return False
+
+
+def send_via_brevo(api_key: str, recipient: str, sender_name: str, sender_email: str, content: str) -> bool:
+    payload = {
+        "sender": {"name": "Portfolio Contact", "email": recipient},
+        "to": [{"email": recipient}],
+        "replyTo": {"email": sender_email, "name": sender_name},
+        "subject": f"New Portfolio Message from {sender_name}",
+        "textContent": (
+            f"You have received a new contact submission from your portfolio website:\n\n"
+            f"Name: {sender_name}\n"
+            f"Email: {sender_email}\n"
+            f"Timestamp (UTC): {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Message:\n{content}\n"
+        ),
+    }
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "api-key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "PortfolioBackend/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status in (200, 201):
+            logging.getLogger(__name__).info("Contact notification delivered via Brevo API to %s", recipient)
+            return True
+    return False
+
+
+def send_via_discord(webhook_url: str, sender_name: str, sender_email: str, content: str) -> bool:
+    payload = {
+        "username": "Portfolio Notifier",
+        "embeds": [
+            {
+                "title": f"📩 New Message from {sender_name}",
+                "color": 3447003,
+                "fields": [
+                    {"name": "Name", "value": sender_name, "inline": True},
+                    {"name": "Email", "value": sender_email, "inline": True},
+                    {"name": "Message", "value": content[:1024]},
+                ],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        webhook_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "PortfolioBackend/1.0",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status in (200, 204):
+            logging.getLogger(__name__).info("Contact notification delivered via Discord Webhook")
+            return True
+    return False
+
+
 def send_contact_email(sender_name: str, sender_email: str, message_content: str) -> None:
+    resend_api_key = os.getenv("RESEND_API_KEY")
+    brevo_api_key = os.getenv("BREVO_API_KEY")
+    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
+    target_email = os.getenv("EMAIL_HOST_USER") or os.getenv("DEFAULT_FROM_EMAIL") or "abishek.s2606@gmail.com"
+
+    # 1. Try Resend HTTP API (Port 443 / HTTPS - not blocked by Render Free Tier)
+    if resend_api_key:
+        try:
+            if send_via_resend(resend_api_key, target_email, sender_name, sender_email, message_content):
+                return
+        except Exception as exc:
+            logging.getLogger(__name__).error("Resend API failed: %s", exc)
+
+    # 2. Try Brevo HTTP API (Port 443 / HTTPS)
+    if brevo_api_key:
+        try:
+            if send_via_brevo(brevo_api_key, target_email, sender_name, sender_email, message_content):
+                return
+        except Exception as exc:
+            logging.getLogger(__name__).error("Brevo API failed: %s", exc)
+
+    # 3. Optional Discord Webhook for instant notification
+    if discord_webhook:
+        try:
+            send_via_discord(discord_webhook, sender_name, sender_email, message_content)
+        except Exception as exc:
+            logging.getLogger(__name__).error("Discord webhook failed: %s", exc)
+
+    # 4. Fallback to standard SMTP (Gmail)
     email_host = os.getenv("EMAIL_HOST")
     email_port = int(os.getenv("EMAIL_PORT", "587"))
     email_user = os.getenv("EMAIL_HOST_USER")
@@ -87,16 +213,21 @@ def send_contact_email(sender_name: str, sender_email: str, message_content: str
 
     try:
         if use_ssl:
-            with smtplib.SMTP_SSL(email_host, email_port, timeout=15) as server:
+            with smtplib.SMTP_SSL(email_host, email_port, timeout=10) as server:
                 server.login(email_user, email_password)
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(email_host, email_port, timeout=15) as server:
+            with smtplib.SMTP(email_host, email_port, timeout=10) as server:
                 if use_tls:
                     server.starttls()
                 server.login(email_user, email_password)
                 server.send_message(msg)
         logging.getLogger(__name__).info("Contact notification email delivered for %s", sender_email)
+    except OSError as err:
+        logging.getLogger(__name__).warning(
+            "SMTP network error (%s). Note: Cloud providers like Render Free Tier block outbound SMTP ports (25, 465, 587). Add RESEND_API_KEY in Render Environment to send via HTTPS port 443.",
+            err,
+        )
     except Exception:
         logging.getLogger(__name__).exception("Failed to send contact notification email via SMTP")
 
