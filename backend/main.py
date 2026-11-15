@@ -155,18 +155,29 @@ async def lifespan(_: FastAPI):
 
 cors_origins_env = os.getenv(
     "CORS_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,https://portfolioabishek.onrender.com/",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,https://portfolioabishek.onrender.com",
 )
-cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+cors_origins = [o.strip().rstrip("/") for o in cors_origins_env.split(",") if o.strip()]
 
 app = FastAPI(title="Abishek Seenivasan Portfolio API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.onrender\.com",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+def root() -> dict[str, str]:
+    return {
+        "status": "online",
+        "message": "Abishek Seenivasan Portfolio API is running",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
 
 
 @app.get("/api/health")
