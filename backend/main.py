@@ -19,25 +19,42 @@ env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SQLALCHEMY_DATABASE_URI")
-if not DATABASE_URL:
-    try:
-        test_url = "postgresql+psycopg://portfolio:portfolio@localhost:5432/portfolio"
-        test_engine = create_engine(test_url, pool_pre_ping=True)
-        with test_engine.connect() as conn:
-            pass
-        test_engine.dispose()
-        DATABASE_URL = test_url
-    except Exception as exc:
-        sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.db")
-        DATABASE_URL = f"sqlite:///{sqlite_path}"
-        logging.getLogger(__name__).warning(
-            "PostgreSQL connection failed (%s). Falling back to SQLite database at %s",
-            exc,
-            sqlite_path,
-        )
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+
+def init_db_engine(db_url: str | None):
+    # Normalize Render / Heroku postgres:// prefix for SQLAlchemy + psycopg 3
+    if db_url:
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+        elif db_url.startswith("postgresql://") and not db_url.startswith("postgresql+"):
+            db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    # Test remote PostgreSQL connectivity
+    if db_url and not db_url.startswith("sqlite"):
+        try:
+            # Short timeout test to verify server is reachable
+            test_engine = create_engine(
+                db_url,
+                pool_pre_ping=True,
+                connect_args={"connect_timeout": 3} if "psycopg" in db_url else {},
+            )
+            with test_engine.connect():
+                pass
+            test_engine.dispose()
+            return create_engine(db_url, pool_pre_ping=True), db_url
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Configured database connection failed (%s). Falling back to SQLite.",
+                exc,
+            )
+
+    # Fallback to local SQLite database
+    sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.db")
+    fallback_url = f"sqlite:///{sqlite_path}"
+    return create_engine(fallback_url, connect_args={"check_same_thread": False}), fallback_url
+
+
+engine, ACTIVE_DATABASE_URL = init_db_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
@@ -118,7 +135,20 @@ class ContactSubmission(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    global engine, SessionLocal
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as exc:
+        logging.getLogger(__name__).error(
+            "Failed to initialize database tables on %s (%s). Falling back to SQLite.",
+            engine.url,
+            exc,
+        )
+        sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.db")
+        fallback_url = f"sqlite:///{sqlite_path}"
+        engine = create_engine(fallback_url, connect_args={"check_same_thread": False})
+        SessionLocal.configure(bind=engine)
+        Base.metadata.create_all(bind=engine)
     yield
     engine.dispose()
 
