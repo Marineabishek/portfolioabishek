@@ -12,11 +12,9 @@ import {
   Cpu,
   Database,
   GitBranch,
-  Layers3,
   Menu,
   Server,
   ShieldCheck,
-  Terminal,
   X,
   Zap,
 } from "lucide-react";
